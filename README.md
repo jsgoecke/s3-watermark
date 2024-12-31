@@ -10,6 +10,7 @@ A Go-based utility for automatically watermarking images stored in AWS S3. This 
   - Right watermark in bottom-right corner
 - Automatically resizes watermarks while maintaining aspect ratio
 - Supports JPG, JPEG, and PNG input images
+- Concurrent processing with 5 workers for improved throughput
 - Comprehensive logging of all operations
 - Configurable through environment variables
 - Full test coverage for core functionality
@@ -18,7 +19,11 @@ A Go-based utility for automatically watermarking images stored in AWS S3. This 
 
 - Go 1.21 or later
 - AWS credentials configured
-- Two PNG watermark images (preferably with transparency)
+- Two PNG watermark files:
+  - Left watermark: placed in bottom-left corner
+  - Right watermark: placed in bottom-right corner
+  - Watermarks are automatically resized to a maximum height of 250 pixels while maintaining aspect ratio
+  - 20 pixel padding from edges
 
 ## Installation
 
@@ -42,8 +47,8 @@ The script requires the following environment variables:
 | `S3_BUCKET` | Name of the S3 bucket | "my-images-bucket" |
 | `SOURCE_PREFIX` | Source directory prefix in S3 | "original/images/" |
 | `TARGET_PREFIX` | Target directory prefix for processed images | "processed/images/" |
-| `LEFT_WATERMARK_PATH` | Path to left watermark PNG file | "/path/to/left-logo.png" |
-| `RIGHT_WATERMARK_PATH` | Path to right watermark PNG file | "/path/to/right-logo.png" |
+| `LEFT_WATERMARK_PATH` | Path to left watermark PNG file or URL | "/path/to/left-logo.png" or "https://example.com/left-logo.png" |
+| `RIGHT_WATERMARK_PATH` | Path to right watermark PNG file or URL | "/path/to/right-logo.png" or "https://example.com/right-logo.png" |
 
 ### AWS Credentials
 
@@ -82,7 +87,7 @@ go run main.go
 
 ## Watermark Specifications
 
-- Maximum height: 100 pixels
+- Maximum height: 250 pixels
 - Edge padding: 20 pixels
 - Position:
   - Left watermark: Bottom-left corner
@@ -153,4 +158,4 @@ go test -v -cover
 
 ## License
 
-[Your chosen license]
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

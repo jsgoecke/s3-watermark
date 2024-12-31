@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"image"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -22,34 +24,76 @@ const (
 	EnvTargetPrefix     = "TARGET_PREFIX"
 	EnvLeftWatermark    = "LEFT_WATERMARK_PATH"
 	EnvRightWatermark   = "RIGHT_WATERMARK_PATH"
-	WatermarkMaxHeight  = 100 // Maximum height of watermark in pixels
-	WatermarkPadding    = 20  // Padding from edges in pixels
+	MaxWatermarkHeight  = 250 // Maximum height of watermark in pixels
+	WatermarkPadding    = 20  // Padding around watermarks in pixels
+	MaxWorkers          = 5   // Maximum number of concurrent workers
 )
+
+// loadWatermarkImage loads a watermark image from a file path or URL
+func loadWatermarkImage(path string) (image.Image, error) {
+	if strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
+		resp, err := http.Get(path)
+		if err != nil {
+			return nil, fmt.Errorf("failed to download watermark from URL %s: %v", path, err)
+		}
+		defer resp.Body.Close()
+		
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("failed to download watermark from URL %s: status code %d", path, resp.StatusCode)
+		}
+		
+		return imaging.Decode(resp.Body)
+	}
+	
+	// Local file path
+	return imaging.Open(path)
+}
+
+// validateWatermarkPath validates a watermark path
+func validateWatermarkPath(path string) error {
+	// Check if it's a URL
+	if strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
+		if !strings.HasSuffix(strings.ToLower(path), ".png") {
+			return fmt.Errorf("watermark URL must end with .png: %s", path)
+		}
+		return nil
+	}
+
+	// For local files, check extension first
+	if !strings.HasSuffix(strings.ToLower(path), ".png") {
+		return fmt.Errorf("watermark must be a PNG file: %s", path)
+	}
+
+	// Then check if file exists
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return fmt.Errorf("watermark file not found: %s", path)
+	}
+
+	return nil
+}
 
 // validateEnvironment checks if all required environment variables are set
 func validateEnvironment() error {
-	required := []string{EnvBucket, EnvSourcePrefix, EnvTargetPrefix, EnvLeftWatermark, EnvRightWatermark}
-	missing := []string{}
+	requiredVars := []string{
+		EnvBucket,
+		EnvSourcePrefix,
+		EnvTargetPrefix,
+		EnvLeftWatermark,
+		EnvRightWatermark,
+	}
 
-	for _, env := range required {
-		if value := os.Getenv(env); value == "" {
-			missing = append(missing, env)
+	for _, v := range requiredVars {
+		if os.Getenv(v) == "" {
+			return fmt.Errorf("required environment variable %s is not set", v)
 		}
 	}
 
-	if len(missing) > 0 {
-		return fmt.Errorf("missing required environment variables: %s", strings.Join(missing, ", "))
+	// Validate watermark files
+	if err := validateWatermarkPath(os.Getenv(EnvLeftWatermark)); err != nil {
+		return err
 	}
-
-	// Verify watermark files exist and are PNG
-	watermarkPaths := []string{os.Getenv(EnvLeftWatermark), os.Getenv(EnvRightWatermark)}
-	for _, path := range watermarkPaths {
-		if !strings.HasSuffix(strings.ToLower(path), ".png") {
-			return fmt.Errorf("watermark file must be PNG: %s", path)
-		}
-		if _, err := os.Stat(path); err != nil {
-			return fmt.Errorf("watermark file not found: %s", path)
-		}
+	if err := validateWatermarkPath(os.Getenv(EnvRightWatermark)); err != nil {
+		return err
 	}
 
 	return nil
@@ -66,29 +110,32 @@ type ImageProcessor struct {
 }
 
 // NewImageProcessor creates a new instance of ImageProcessor
-func NewImageProcessor(sourceBucket, sourcePrefix, targetPrefix, leftWatermarkPath, rightWatermarkPath string) (*ImageProcessor, error) {
-	logger := log.New(os.Stdout, "[S3-WATERMARK] ", log.Ldate|log.Ltime|log.Lmicroseconds|log.Lshortfile)
-
-	if sourceBucket == "" || sourcePrefix == "" || targetPrefix == "" || leftWatermarkPath == "" || rightWatermarkPath == "" {
-		return nil, fmt.Errorf("all parameters must be non-empty: bucket=%s, sourcePrefix=%s, targetPrefix=%s", 
-			sourceBucket, sourcePrefix, targetPrefix)
+func NewImageProcessor(ctx context.Context, logger *log.Logger) (*ImageProcessor, error) {
+	if logger == nil {
+		return nil, fmt.Errorf("logger is required")
 	}
 
-	logger.Printf("Loading watermark images...")
-	leftWatermark, err := imaging.Open(leftWatermarkPath)
+	if err := validateEnvironment(); err != nil {
+		return nil, err
+	}
+
+	leftWatermarkPath := os.Getenv(EnvLeftWatermark)
+	rightWatermarkPath := os.Getenv(EnvRightWatermark)
+
+	leftWatermark, err := loadWatermarkImage(leftWatermarkPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load left watermark: %v", err)
 	}
 
-	rightWatermark, err := imaging.Open(rightWatermarkPath)
+	rightWatermark, err := loadWatermarkImage(rightWatermarkPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load right watermark: %v", err)
 	}
 
 	logger.Printf("Initializing ImageProcessor with bucket: %s, source prefix: %s, target prefix: %s", 
-		sourceBucket, sourcePrefix, targetPrefix)
+		os.Getenv(EnvBucket), os.Getenv(EnvSourcePrefix), os.Getenv(EnvTargetPrefix))
 
-	cfg, err := config.LoadDefaultConfig(context.Background())
+	cfg, err := config.LoadDefaultConfig(ctx)
 	if err != nil {
 		logger.Printf("ERROR: Failed to load AWS SDK config: %v", err)
 		return nil, fmt.Errorf("unable to load SDK config: %v", err)
@@ -97,22 +144,25 @@ func NewImageProcessor(sourceBucket, sourcePrefix, targetPrefix, leftWatermarkPa
 	logger.Printf("Successfully initialized AWS SDK configuration")
 	return &ImageProcessor{
 		s3Client:       s3.NewFromConfig(cfg),
-		sourceBucket:   sourceBucket,
-		sourcePrefix:   sourcePrefix,
-		targetPrefix:   targetPrefix,
+		sourceBucket:   os.Getenv(EnvBucket),
+		sourcePrefix:   os.Getenv(EnvSourcePrefix),
+		targetPrefix:   os.Getenv(EnvTargetPrefix),
 		leftWatermark:  leftWatermark,
 		rightWatermark: rightWatermark,
 		logger:         logger,
 	}, nil
 }
 
-// ProcessImages handles the main workflow
-func (ip *ImageProcessor) ProcessImages() error {
+type ProcessResult struct {
+	Key string
+	Err error
+}
+
+func (ip *ImageProcessor) ProcessImages(ctx context.Context) error {
 	startTime := time.Now()
 	ip.logger.Printf("Starting image processing workflow")
-	ctx := context.Background()
 	
-	ip.logger.Printf("Listing objects in bucket: %s with prefix: %s", ip.sourceBucket, ip.sourcePrefix)
+	// Get list of images to process
 	input := &s3.ListObjectsV2Input{
 		Bucket: &ip.sourceBucket,
 		Prefix: &ip.sourcePrefix,
@@ -124,35 +174,75 @@ func (ip *ImageProcessor) ProcessImages() error {
 		return fmt.Errorf("failed to list objects: %v", err)
 	}
 
-	totalFiles := len(result.Contents)
-	processedFiles := 0
-	skippedFiles := 0
-	failedFiles := 0
+	if len(result.Contents) == 0 {
+		ip.logger.Printf("No images found in bucket %s with prefix %s", ip.sourceBucket, ip.sourcePrefix)
+		return nil
+	}
 
-	ip.logger.Printf("Found %d objects in bucket", totalFiles)
+	// Create channels for work distribution and results
+	jobs := make(chan string, len(result.Contents))
+	results := make(chan ProcessResult, len(result.Contents))
+	
+	// Start worker pool
+	var wg sync.WaitGroup
+	for w := 1; w <= MaxWorkers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for key := range jobs {
+				err := ip.processImage(ctx, key)
+				results <- ProcessResult{
+					Key: key,
+					Err: err,
+				}
+				if err != nil {
+					ip.logger.Printf("Worker %d: Failed to process %s: %v", workerID, key, err)
+				} else {
+					ip.logger.Printf("Worker %d: Successfully processed %s", workerID, key)
+				}
+			}
+		}(w)
+	}
 
-	for _, object := range result.Contents {
-		if !isImageFile(*object.Key) {
-			ip.logger.Printf("Skipping non-image file: %s", *object.Key)
-			skippedFiles++
+	// Send jobs to workers
+	imageCount := 0
+	for _, obj := range result.Contents {
+		if obj.Key == nil {
 			continue
 		}
-
-		ip.logger.Printf("Processing image: %s", *object.Key)
-		if err := ip.processImage(ctx, *object.Key); err != nil {
-			ip.logger.Printf("ERROR: Failed to process image %s: %v", *object.Key, err)
-			failedFiles++
+		key := *obj.Key
+		if !isImageFile(key) {
 			continue
 		}
-		processedFiles++
+		jobs <- key
+		imageCount++
+	}
+	close(jobs)
+
+	// Wait for all workers to complete
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	// Process results
+	var errors []error
+	successCount := 0
+	for result := range results {
+		if result.Err != nil {
+			errors = append(errors, fmt.Errorf("failed to process %s: %v", result.Key, result.Err))
+		} else {
+			successCount++
+		}
+	}
+
+	// Log summary
+	ip.logger.Printf("Processing complete. Successfully processed %d/%d images", successCount, imageCount)
+	if len(errors) > 0 {
+		return fmt.Errorf("encountered %d errors during processing: %v", len(errors), errors)
 	}
 
 	duration := time.Since(startTime)
-	ip.logger.Printf("Processing complete - Summary:")
-	ip.logger.Printf("Total files: %d", totalFiles)
-	ip.logger.Printf("Successfully processed: %d", processedFiles)
-	ip.logger.Printf("Skipped: %d", skippedFiles)
-	ip.logger.Printf("Failed: %d", failedFiles)
 	ip.logger.Printf("Total duration: %v", duration)
 
 	return nil
@@ -188,73 +278,76 @@ func (ip *ImageProcessor) processImage(ctx context.Context, key string) error {
 
 	// Add watermark
 	ip.logger.Printf("Adding watermark to image: %s", key)
-	watermarked := ip.addWatermark(img)
+	watermarked, err := ip.addWatermark(img)
+	if err != nil {
+		return fmt.Errorf("failed to add watermark to image %s: %v", key, err)
+	}
 
 	// Create temporary file
-	ip.logger.Printf("Creating temporary file for processed image")
-	tempFile, err := os.CreateTemp("", "watermarked-*.png")
+	ip.logger.Printf("Creating temporary file for processed image: %s", key)
+	tempFile, err := os.CreateTemp("", "watermarked-*.jpg")
 	if err != nil {
 		return fmt.Errorf("failed to create temp file: %v", err)
 	}
 	defer os.Remove(tempFile.Name())
-	defer tempFile.Close()
 
-	// Save watermarked image
-	ip.logger.Printf("Saving watermarked image to temporary file: %s", tempFile.Name())
-	if err := imaging.Save(watermarked, tempFile.Name()); err != nil {
-		return fmt.Errorf("failed to save watermarked image: %v", err)
+	// Save processed image to temp file
+	err = imaging.Save(watermarked, tempFile.Name())
+	if err != nil {
+		return fmt.Errorf("failed to save processed image: %v", err)
 	}
 
-	// Upload to target location
-	targetKey := filepath.Join(ip.targetPrefix, filepath.Base(key))
-	ip.logger.Printf("Uploading watermarked image to target location: %s", targetKey)
-	if err := ip.uploadImage(ctx, tempFile.Name(), targetKey); err != nil {
-		return fmt.Errorf("failed to upload watermarked image: %v", err)
+	// Upload processed image
+	targetKey := strings.Replace(key, ip.sourcePrefix, ip.targetPrefix, 1)
+	ip.logger.Printf("Uploading processed image to: %s", targetKey)
+
+	err = ip.uploadImage(ctx, tempFile.Name(), targetKey)
+	if err != nil {
+		return fmt.Errorf("failed to upload processed image %s: %v", targetKey, err)
 	}
 
 	duration := time.Since(startTime)
 	ip.logger.Printf("Successfully processed image %s in %v", key, duration)
-
 	return nil
 }
 
-// addWatermark adds watermark images to the bottom corners of the image
-func (ip *ImageProcessor) addWatermark(img image.Image) image.Image {
+// addWatermark adds watermarks to the given image
+func (ip *ImageProcessor) addWatermark(img image.Image) (image.Image, error) {
 	ip.logger.Printf("Adding watermarks to image")
 	ip.logger.Printf("Original image dimensions: %dx%d", img.Bounds().Dx(), img.Bounds().Dy())
-	
-	// Clone the original image
+
+	// Convert to RGBA if it's not already
 	watermarked := imaging.Clone(img)
 	imgWidth := watermarked.Bounds().Dx()
 	imgHeight := watermarked.Bounds().Dy()
-	
-	// Resize watermarks if needed while maintaining aspect ratio
+
+	// Create copies of watermarks for resizing
 	leftWatermark := ip.leftWatermark
 	rightWatermark := ip.rightWatermark
 	
-	if leftWatermark.Bounds().Dy() > WatermarkMaxHeight {
-		leftWatermark = imaging.Resize(leftWatermark, 0, WatermarkMaxHeight, imaging.Lanczos)
-		ip.logger.Printf("Resized left watermark to height: %d", WatermarkMaxHeight)
+	if leftWatermark.Bounds().Dy() > MaxWatermarkHeight {
+		leftWatermark = imaging.Resize(leftWatermark, 0, MaxWatermarkHeight, imaging.Lanczos)
+		ip.logger.Printf("Resized left watermark to height: %d", MaxWatermarkHeight)
 	}
 	
-	if rightWatermark.Bounds().Dy() > WatermarkMaxHeight {
-		rightWatermark = imaging.Resize(rightWatermark, 0, WatermarkMaxHeight, imaging.Lanczos)
-		ip.logger.Printf("Resized right watermark to height: %d", WatermarkMaxHeight)
+	if rightWatermark.Bounds().Dy() > MaxWatermarkHeight {
+		rightWatermark = imaging.Resize(rightWatermark, 0, MaxWatermarkHeight, imaging.Lanczos)
+		ip.logger.Printf("Resized right watermark to height: %d", MaxWatermarkHeight)
 	}
 	
 	// Calculate positions for watermarks
 	leftX := WatermarkPadding
 	rightX := imgWidth - rightWatermark.Bounds().Dx() - WatermarkPadding
-	y := imgHeight - WatermarkMaxHeight - WatermarkPadding
+	y := imgHeight - MaxWatermarkHeight - WatermarkPadding
 	
 	// Add left watermark
 	watermarked = imaging.Overlay(watermarked, leftWatermark, image.Pt(leftX, y), 1.0)
 	
 	// Add right watermark
 	watermarked = imaging.Overlay(watermarked, rightWatermark, image.Pt(rightX, y), 1.0)
-	
+
 	ip.logger.Printf("Watermarks added successfully")
-	return watermarked
+	return watermarked, nil
 }
 
 // uploadImage uploads the processed image to S3
@@ -293,33 +386,31 @@ func isImageFile(filename string) bool {
 }
 
 func main() {
-	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds | log.Lshortfile)
-	log.Printf("Starting S3 Watermark Script")
+	logger := log.New(os.Stdout, "[S3-WATERMARK] ", log.LstdFlags|log.Lshortfile)
+	logger.Printf("Starting S3 Watermark Script")
 
 	if err := validateEnvironment(); err != nil {
-		log.Fatalf("Environment validation failed: %v\nRequired environment variables:\n"+
+		logger.Printf("Environment validation failed: %v\nRequired environment variables:\n"+
 			"  %s: S3 bucket name\n"+
 			"  %s: Source directory prefix in S3\n"+
 			"  %s: Target directory prefix in S3\n"+
-			"  %s: Path to left watermark PNG file\n"+
-			"  %s: Path to right watermark PNG file\n",
+			"  %s: Path to left watermark PNG file or URL\n"+
+			"  %s: Path to right watermark PNG file or URL\n",
 			err, EnvBucket, EnvSourcePrefix, EnvTargetPrefix, EnvLeftWatermark, EnvRightWatermark)
+		os.Exit(1)
 	}
 
-	processor, err := NewImageProcessor(
-		os.Getenv(EnvBucket),
-		os.Getenv(EnvSourcePrefix),
-		os.Getenv(EnvTargetPrefix),
-		os.Getenv(EnvLeftWatermark),
-		os.Getenv(EnvRightWatermark),
-	)
+	ctx := context.Background()
+	processor, err := NewImageProcessor(ctx, logger)
 	if err != nil {
-		log.Fatalf("Failed to create image processor: %v", err)
+		logger.Printf("Failed to initialize image processor: %v", err)
+		os.Exit(1)
 	}
 
-	if err := processor.ProcessImages(); err != nil {
-		log.Fatalf("Failed to process images: %v", err)
+	if err := processor.ProcessImages(ctx); err != nil {
+		logger.Printf("Failed to process images: %v", err)
+		os.Exit(1)
 	}
 
-	log.Println("Successfully completed all image processing")
+	logger.Println("Successfully completed all image processing")
 }
